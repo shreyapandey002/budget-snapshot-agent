@@ -253,7 +253,7 @@ async def generate_budget(file: UploadFile, instructions: str = Form("")):
     # Run heavy part in threadpool
     try:
         tmp_pdf_file = await run_in_threadpool(process_and_generate)
-        download_link = f"http://127.0.0.1:8000/download/{os.path.basename(tmp_pdf_file)}"
+        download_link = f"https://budget-snapshot-agent.onrender.com/download/{os.path.basename(tmp_pdf_file)}"
         return {"status": "success", "download_link": download_link}
     finally:
         if os.path.exists(tmp_file_path):
