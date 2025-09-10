@@ -125,27 +125,32 @@ def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, 
 
 
 # ---------- Apply JSON Adjustments ----------
-def apply_json_adjustments(df, adjustments):
-    try:
-        for adj in adjustments.get("adjustments", []):
-            dept = adj.get("domain", "").lower()
-            change = adj.get("change", "")
-            if not dept or not change:
+def apply_json_adjustments(df: pd.DataFrame, adjustments: list):
+    for adj in adjustments:
+        dept = adj.get("domain", "").lower()
+        change = adj.get("change", "").strip()
+
+        if not dept or not change:
+            continue
+
+        # Clean % value
+        if "%" in change:
+            num = float(change.replace("%", "").replace("+", "").replace("-", ""))
+            factor = 1 + (num / 100) if change.startswith("+") else 1 - (num / 100)
+        else:
+            try:
+                num = float(change)
+                factor = 1 + (num / 100)
+            except:
                 continue
 
-            if "%" in change:
-                num = float(change.strip("%").replace("+", "").replace("-", ""))
-                if change.startswith("-"):
-                    df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 - num / 100)
-                else:
-                    df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 + num / 100)
-    except Exception as e:
-        print("Invalid adjustments JSON:", e)
+        # Apply to matching department
+        mask = df["department"].str.lower() == dept
+        df.loc[mask, "after_budget"] *= factor
 
     return df
 
 
-# ---------- Summaries ----------
 def summarize_department_spending(df: pd.DataFrame):
     summary = (
         df.groupby("department")[["before_budget", "after_budget"]]
@@ -182,10 +187,7 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
     pdf.set_font("Arial", "", 10)
     for _, row in weekly_df.iterrows():
         week_range = f"{row['week_start'].strftime('%Y-%m-%d')} to {row['week_end'].strftime('%Y-%m-%d')}"
-        percent_change = (
-            (row['after_budget'] - row['before_budget']) / row['before_budget'] * 100
-            if row['before_budget'] else 0
-        )
+        percent_change = ((row['after_budget'] - row['before_budget']) / row['before_budget'] * 100) if row['before_budget'] else 0
         values = [
             row["department"],
             week_range,
@@ -247,7 +249,6 @@ async def generate_budget(
         df = normalize_columns(df)
         weekly_df = aggregate_weekly(df)
 
-        # Apply natural language
         forecasts, constraints, goals = parse_user_instructions(instructions)
         final_df = apply_forecasts_constraints_goals(weekly_df, forecasts, constraints, goals)
 
@@ -255,12 +256,11 @@ async def generate_budget(
         if adjustments:
             try:
                 adj_obj = json.loads(adjustments)
-                final_df = apply_json_adjustments(final_df, adj_obj)
+                final_df = apply_json_adjustments(final_df, adj_obj.get("adjustments", []))
             except Exception as e:
                 print("Invalid adjustments JSON:", e)
 
         summary_df = summarize_department_spending(final_df)
-
         tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
         generate_budget_pdf(final_df, summary_df, tmp_pdf_file)
         return tmp_pdf_file
