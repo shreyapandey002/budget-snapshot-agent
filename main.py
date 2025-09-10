@@ -138,7 +138,7 @@ async def generate_budget(file: UploadFile = File(...), request: Optional[str] =
 
     try:
         tmp_pdf_file = await run_in_threadpool(process_and_generate)
-        return {"status": "success", "download_link": f"http://127.0.0.1:8000/download/{os.path.basename(tmp_pdf_file)}"}
+        return {"status": "success", "download_link": f"https://budget-snapshot-agent.onrender.com/download/{os.path.basename(tmp_pdf_file)}"}
     finally:
         if os.path.exists(tmp_file_path):
             os.remove(tmp_file_path)
@@ -171,7 +171,7 @@ async def generate_budget_url(request: BudgetRequest):
             return tmp_pdf_file
 
         tmp_pdf_file = await run_in_threadpool(process_and_generate)
-        return {"status": "success", "download_link": f"http://127.0.0.1:8000/download/{os.path.basename(tmp_pdf_file)}"}
+        return {"status": "success", "download_link": f"https://budget-snapshot-agent.onrender.com/download/{os.path.basename(tmp_pdf_file)}"}
 
     finally:
         if "tmp_file_path" in locals() and os.path.exists(tmp_file_path):
