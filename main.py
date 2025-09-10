@@ -243,21 +243,30 @@ async def generate_budget(
         df = normalize_columns(df)
         weekly_df = aggregate_weekly(df)
 
+        forecasts, constraints, goals = parse_user_instructions(instructions)
+
+        final_df = apply_forecasts_constraints_goals(weekely_df, forecasts, constraints, goals)
+        
+
         # Apply JSON adjustments first (if provided)
         if adjustments:
             try:
                 adj_obj = json.loads(adjustments)
-                weekly_df = apply_adjustments(weekly_df, adj_obj.get("adjustments", []))
+                for adj in adj_obj.get("adjustments", []):
+                    dept = adj.get("domain", "").lower()
+                    change = adj.get("change", "")
+                    if "%" in change:
+                        num = int(change.strip("%").replace("+", "").replace("-", ""))
+                        if change.startswith("-"):
+                           final_df.loc[final_df["department"].str.lower() == dept, "after_budget"] *= (1 - num / 100)
+                        elif change.startswith("+"):
+                            final_df.loc[final_df["department"].str.lower() == dept, "after_budget"] *= (1 + num / 100)
             except Exception as e:
                 print("Invalid adjustments JSON:", e)
 
-        # Apply natural language instructions too (optional, fallback)
-        forecasts, constraints, goals = parse_user_instructions(instructions)
-        weekly_df = apply_forecasts_constraints_goals(weekly_df, forecasts, constraints, goals)
-
-        summary_df = summarize_department_spending(weekly_df)
+        summary_df = summarize_department_spending(final_df)
         tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
-        generate_budget_pdf(weekly_df, summary_df, tmp_pdf_file)
+        generate_budget_pdf(final_df, summary_df, tmp_pdf_file)
         return tmp_pdf_file
 
     try:
