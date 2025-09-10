@@ -74,16 +74,23 @@ def apply_json_adjustments(df: pd.DataFrame, adjustments: List[Adjustment]):
         if not target or not change:
             continue
 
-        # parse percentage change
-        if "%" in change:
-            num = float(change.replace("%", "").replace("+", "").replace("-", ""))
-            factor = 1 + (num / 100) if change.startswith("+") else 1 - (num / 100)
-        else:
-            try:
+        factor = 1.0
+        try:
+            if "%" in change:
+                raw = change.replace("%", "").strip()
+                num = float(raw)
+                if change.startswith("-"):
+                    factor = 1 - (num / 100)
+                else:  # handles "+5%" or "5%"
+                    factor = 1 + (num / 100)
+            else:
                 num = float(change)
-                factor = 1 + (num / 100)
-            except:
-                continue
+                if change.startswith("-"):
+                    factor = 1 - (num / 100)
+                else:  # bare number = increase
+                    factor = 1 + (num / 100)
+        except:
+            continue
 
         # match department
         mask = df["department"].str.lower() == target
@@ -95,6 +102,7 @@ def apply_json_adjustments(df: pd.DataFrame, adjustments: List[Adjustment]):
             df.loc[mask, "after_budget"] *= factor
 
     return df
+
 
 def summarize_spending(df: pd.DataFrame):
     group_cols = ["department"]
