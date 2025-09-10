@@ -1,7 +1,7 @@
 # budget_snapshot_agent.py
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 from typing import List, Optional, Tuple
 import pandas as pd
 import tempfile
@@ -32,6 +32,13 @@ class Adjustment(BaseModel):
     domain: str = Field(..., description="department name or expense_category name (case-insensitive)")
     change: str = Field(..., description="percent like '5%', '-10%', '+5' or numeric interpreted as percent")
 
+class Instruction(BaseModel):
+    action: str  # "adjust", "merge", "remove", "allocate", "headcount"
+    domain: Optional[str] = None
+    target: Optional[str] = None   # for merge target
+    change: Optional[str] = None   # "+10%", "-5%" for adjust/headcount
+    percent: Optional[float] = None  # for allocate
+
 class BudgetRequest(BaseModel):
     file_url: Optional[str] = None
     instructions: Optional[str] = ""
@@ -54,7 +61,6 @@ def find_column(df_cols, synonyms):
     return None
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # lowercase columns
     df = df.copy()
     df.columns = [c.lower().strip() for c in df.columns]
     col_map = {}
@@ -65,27 +71,25 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             col_map[found] = canon
 
     df = df.rename(columns=col_map)
+
     # required checks
     if "date" not in df.columns:
         raise ValueError("Missing required column: date")
     if "department" not in df.columns:
         raise ValueError("Missing required column: department")
     if "amount" not in df.columns:
-        # allow 'total' or fallback
         raise ValueError("Missing required column: amount (or synonyms)")
 
-    # if tax exists: add to amount (safe numeric)
+    # if tax exists: add to amount
     if "tax" in df.columns:
         df["tax"] = pd.to_numeric(df["tax"], errors="coerce").fillna(0.0)
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0) + df["tax"]
 
-    # parse date & amount
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
-    # drop invalid rows
     df = df.dropna(subset=["date", "department", "amount"])
-    # normalize text fields
+
     df["department"] = df["department"].astype(str).str.strip()
     if "expense_category" in df.columns:
         df["expense_category"] = df["expense_category"].astype(str).str.strip()
@@ -102,8 +106,6 @@ def aggregate_weekly(df: pd.DataFrame) -> pd.DataFrame:
     weekly_df = df.groupby(group_cols)["amount"].sum().reset_index()
     weekly_df = weekly_df.rename(columns={"amount": "before_budget"})
     weekly_df["after_budget"] = weekly_df["before_budget"].astype(float).copy()
-
-    # ensure numeric and non-negative
     weekly_df["before_budget"] = pd.to_numeric(weekly_df["before_budget"], errors="coerce").fillna(0.0)
     weekly_df["after_budget"] = pd.to_numeric(weekly_df["after_budget"], errors="coerce").fillna(0.0)
     return weekly_df
@@ -112,15 +114,6 @@ def aggregate_weekly(df: pd.DataFrame) -> pd.DataFrame:
 PCT_RE = re.compile(r"^([+-]?\s*\d+(\.\d+)?)\s*%?$")
 
 def parse_change_to_factor(change: str) -> Optional[float]:
-    """
-    Accepts:
-      "5%" -> 1.05
-      "+5%" -> 1.05
-      "-10%" -> 0.9
-      "5" -> 1.05
-      "-5" -> 0.95
-    Returns factor (float) or None if cannot parse.
-    """
     if not isinstance(change, str):
         return None
     s = change.strip().replace(" ", "")
@@ -131,11 +124,9 @@ def parse_change_to_factor(change: str) -> Optional[float]:
         num = float(m.group(1))
     except Exception:
         return None
-    # bare number means percent (not decimal)
     return 1.0 + (num / 100.0)
 
 def match_mask_for_domain(df: pd.DataFrame, domain: str) -> pd.Series:
-    """Return a boolean mask of rows matching the domain: department OR expense_category matches exactly (case-insensitive)"""
     domain_clean = domain.strip().lower()
     mask_dept = df["department"].astype(str).str.lower() == domain_clean
     mask_cat = pd.Series(False, index=df.index)
@@ -143,90 +134,79 @@ def match_mask_for_domain(df: pd.DataFrame, domain: str) -> pd.Series:
         mask_cat = df["expense_category"].astype(str).str.lower() == domain_clean
     return mask_dept | mask_cat
 
-def apply_json_adjustments(weekly_df: pd.DataFrame, adjustments: List[Adjustment]) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Applies adjustments (percentage factors) to weekly_df rows.
-    Maintains total company spend via hybrid rebalance:
-        - Rows matched by any adjustment are considered constrained (their after_budget are set by adj factors)
-        - Remaining rows are scaled proportionally so total_after == total_before
-    Returns (updated_df, warnings)
-    """
+def apply_instructions(weekly_df: pd.DataFrame, instructions: List[Instruction]) -> Tuple[pd.DataFrame, List[str]]:
     df = weekly_df.copy()
-    df["after_budget"] = df["after_budget"].astype(float).copy()
     warnings = []
     constrained_mask = pd.Series(False, index=df.index)
 
-    # apply per-adjustment
-    for adj in adjustments or []:
-        domain = (adj.domain or "").strip()
-        change = (adj.change or "").strip()
-        if not domain or not change:
-            warnings.append(f"Skipping invalid adjustment (empty domain/change): {adj}")
+    # Merge
+    for instr in [i for i in instructions if i.action == "merge"]:
+        mask_src = match_mask_for_domain(df, instr.domain)
+        mask_tgt = match_mask_for_domain(df, instr.target) if instr.target else pd.Series(False, index=df.index)
+        if not mask_src.any():
+            warnings.append(f"No rows matched to merge from '{instr.domain}'")
             continue
-        factor = parse_change_to_factor(change)
-        if factor is None or not math.isfinite(factor):
-            warnings.append(f"Could not parse change '{change}' for domain '{domain}'")
+        if not mask_tgt.any():
+            warnings.append(f"No rows matched to merge into '{instr.target}', skipping merge")
             continue
+        df.loc[mask_tgt, ["before_budget", "after_budget"]] += df.loc[mask_src, ["before_budget", "after_budget"]].sum()
+        df = df.loc[~mask_src]
 
-        mask = match_mask_for_domain(df, domain)
+    # Remove
+    for instr in [i for i in instructions if i.action == "remove"]:
+        mask = match_mask_for_domain(df, instr.domain)
         if not mask.any():
-            # If no exact match, attempt partial match (contains)
-            domain_low = domain.lower()
-            mask_partial = df["department"].astype(str).str.lower().str.contains(domain_low) | \
-                           (df["expense_category"].astype(str).str.lower().str.contains(domain_low) if "expense_category" in df.columns else pd.Series(False, index=df.index))
-            if mask_partial.any():
-                mask = mask_partial
-                warnings.append(f"No exact match for '{domain}'; applied to partial matches.")
-            else:
-                warnings.append(f"No rows matched domain '{domain}'. Skipping.")
-                continue
+            warnings.append(f"No rows matched to remove '{instr.domain}'")
+            continue
+        df = df.loc[~mask]
 
-        # apply factor
-        df.loc[mask, "after_budget"] = df.loc[mask, "after_budget"].astype(float) * float(factor)
+    # Allocate
+    total_before = df["before_budget"].sum()
+    for instr in [i for i in instructions if i.action == "allocate"]:
+        mask = match_mask_for_domain(df, instr.domain)
+        if not mask.any():
+            warnings.append(f"No rows matched to allocate to '{instr.domain}'")
+            continue
+        target_share = (instr.percent / 100.0) * total_before
+        df.loc[mask, "after_budget"] = target_share
         constrained_mask = constrained_mask | mask
 
-    # Now rebalance to preserve company total (if any constraints applied)
-    total_before = df["before_budget"].sum()
+    # Headcount + Adjust
+    for instr in [i for i in instructions if i.action in ["headcount", "adjust"]]:
+        factor = parse_change_to_factor(instr.change)
+        if factor is None:
+            warnings.append(f"Invalid change '{instr.change}' for {instr.domain}")
+            continue
+        mask = match_mask_for_domain(df, instr.domain)
+        if not mask.any():
+            warnings.append(f"No rows matched for {instr.action} '{instr.domain}'")
+            continue
+        df.loc[mask, "after_budget"] *= factor
+        constrained_mask = constrained_mask | mask
+
+    # Rebalance
     total_after_constrained = df.loc[constrained_mask, "after_budget"].sum()
     remaining_after = df.loc[~constrained_mask, "after_budget"].sum()
 
-    # If there were no constraints, nothing to rebalance
-    if constrained_mask.any():
-        # If remaining rows are zero but company totals are mismatched -> warn and skip rebalance
-        if remaining_after == 0:
-            if not math.isclose(total_after_constrained, total_before, rel_tol=1e-9, abs_tol=1e-6):
-                warnings.append("All rows were constrained or remaining budget is zero; cannot rebalance remaining rows to preserve total. Totals may not match.")
-            # nothing to do
+    if constrained_mask.any() and remaining_after > 0:
+        rebalancer = (total_before - total_after_constrained) / remaining_after
+        if math.isfinite(rebalancer) and rebalancer > 0:
+            df.loc[~constrained_mask, "after_budget"] *= rebalancer
         else:
-            # rebalancer ensures total_after = total_before
-            rebalancer = (total_before - total_after_constrained) / remaining_after
-            # if rebalancer negative or zero -> warn and skip scaling (avoids negative budgets)
-            if not math.isfinite(rebalancer) or rebalancer <= 0:
-                warnings.append(f"Computed rebalancer {rebalancer:.4f} invalid; skipping proportional rebalance to avoid negative budgets.")
-            else:
-                df.loc[~constrained_mask, "after_budget"] = df.loc[~constrained_mask, "after_budget"] * rebalancer
+            warnings.append("Invalid rebalancer, skipped proportional scaling")
 
-    # numeric safety: clamp negatives to 0
-    df["after_budget"] = pd.to_numeric(df["after_budget"], errors="coerce").fillna(0.0)
-    df.loc[df["after_budget"] < 0, "after_budget"] = 0.0
-
+    df["after_budget"] = df["after_budget"].clip(lower=0)
     return df, warnings
 
 def summarize_spending(df: pd.DataFrame) -> pd.DataFrame:
     group_cols = ["department"]
     if "expense_category" in df.columns:
         group_cols.append("expense_category")
-
     summary = df.groupby(group_cols)[["before_budget", "after_budget"]].sum().reset_index()
-    # percent change safe computation
     def pct_change(before, after):
         if before == 0:
-            # if both zero -> 0%; if before zero and after >0 -> inf, represent as None or large
-            if after == 0:
-                return 0.0
-            return float("inf")
+            return 0.0 if after == 0 else float("inf")
         return round((after - before) / before * 100, 2)
-
     summary["percent_change"] = summary.apply(lambda r: pct_change(r["before_budget"], r["after_budget"]), axis=1)
     return summary
 
@@ -239,7 +219,6 @@ def _paged_table_to_pdf(pdf: FPDF, headers: List[str], rows: List[List[str]], co
     max_lines_per_page = int((pdf.h - 40) / line_h)
     cur_line = 0
 
-    # header function
     def render_header():
         pdf.set_font("Arial", "B", font_size)
         for h, w in zip(headers, col_widths):
@@ -260,12 +239,21 @@ def _paged_table_to_pdf(pdf: FPDF, headers: List[str], rows: List[List[str]], co
         pdf.ln()
         cur_line += 1
 
-def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: str):
+def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: str, instructions_text: str = "", warnings: List[str] = []):
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, "Budget Snapshot Report", 0, 1, "C")
+
+    # Instructions + Warnings at top
+    pdf.set_font("Arial", "B", 12)
+    if instructions_text:
+        pdf.multi_cell(0, 6, f"Instructions:\n{instructions_text}")
+    if warnings:
+        pdf.set_font("Arial", "I", 11)
+        pdf.multi_cell(0, 6, "Warnings:\n" + "\n".join(warnings))
+    pdf.ln(5)
 
     # Weekly breakdown
     pdf.set_font("Arial", "B", 12)
@@ -327,89 +315,100 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
 # -------------------------------
 # Simple instruction parser for free-text
 # -------------------------------
-def parse_user_instructions(text: str) -> List[Adjustment]:
-    """
-    Very lightweight parser:
-      - splits by 'and' or comma
-      - looks for patterns like 'reduce X by 5%' / 'increase marketing by 10%'
-      - fallback: picks tokens where a noun and percent appear
-    """
+def parse_user_instructions(text: str) -> List[Instruction]:
     if not text or not text.strip():
         return []
+
     parts = re.split(r",|\band\b", text, flags=re.IGNORECASE)
-    adjustments = []
+    instructions: List[Instruction] = []
+
     for p in parts:
         p_str = p.strip()
-        # look for +/- percent
-        m = re.search(r"(reduce|decrease|cut|lower)\s+([a-zA-Z &\-]+?)\s+by\s+([+-]?\d+(\.\d+)?\s*%?)", p_str, flags=re.IGNORECASE)
-        if m:
-            domain = m.group(2).strip()
-            change = "-" + m.group(3).strip().lstrip("+-")
-            adjustments.append(Adjustment(domain=domain, change=change))
+        if not p_str:
             continue
-        m = re.search(r"(increase|boost|raise|grow|expand)\s+([a-zA-Z &\-]+?)\s+by\s+([+-]?\d+(\.\d+)?\s*%?)", p_str, flags=re.IGNORECASE)
+
+        # Merge
+        m = re.search(r"merge\s+([a-zA-Z &\-]+)\s+into\s+([a-zA-Z &\-]+)", p_str, flags=re.IGNORECASE)
         if m:
-            domain = m.group(2).strip()
+            instructions.append(Instruction(action="merge", domain=m.group(1).strip(), target=m.group(2).strip()))
+            continue
+
+        # Remove
+        m = re.search(r"(remove|eliminate|delete)\s+([a-zA-Z &\-]+)", p_str, flags=re.IGNORECASE)
+        if m:
+            instructions.append(Instruction(action="remove", domain=m.group(2).strip()))
+            continue
+
+        # Allocate
+        m = re.search(r"allocate\s+(\d+(\.\d+)?)%\s+(of\s+(the\s+)?)?(total\s+budget|budget)\s+(to|for)\s+([a-zA-Z &\-]+)", p_str, flags=re.IGNORECASE)
+        if m:
+            instructions.append(Instruction(action="allocate", domain=m.group(7).strip(), percent=float(m.group(1))))
+            continue
+
+        # Headcount
+        m = re.search(r"(increase|decrease|reduce)\s+([a-zA-Z &\-]+)\s+headcount\s+by\s+([+-]?\d+(\.\d+)?\s*%?)", p_str, flags=re.IGNORECASE)
+        if m:
             change = m.group(3).strip()
-            adjustments.append(Adjustment(domain=domain, change=change))
+            if m.group(1).lower() in ["decrease", "reduce"] and not change.startswith("-"):
+                change = "-" + change
+            instructions.append(Instruction(action="headcount", domain=m.group(2).strip(), change=change))
             continue
-        # fallback: find something like "marketing 10%" or "travel -5%"
-        m2 = re.search(r"([a-zA-Z &\-]+?)\s*([+-]?\d+(\.\d+)?\s*%?)$", p_str)
-        if m2:
-            domain = m2.group(1).strip()
-            change = m2.group(2).strip()
-            adjustments.append(Adjustment(domain=domain, change=change))
+
+        # Adjust
+        m = re.search(r"(increase|decrease|reduce)\s+([a-zA-Z &\-]+)\s+by\s+([+-]?\d+(\.\d+)?\s*%?)", p_str, flags=re.IGNORECASE)
+        if m:
+            change = m.group(3).strip()
+            if m.group(1).lower() in ["decrease", "reduce"] and not change.startswith("-"):
+                change = "-" + change
+            instructions.append(Instruction(action="adjust", domain=m.group(2).strip(), change=change))
             continue
-    return adjustments
+
+        # Bare fallback
+        m = re.search(r"([a-zA-Z &\-]+)\s*([+-]?\d+(\.\d+)?\s*%?)$", p_str)
+        if m:
+            instructions.append(Instruction(action="adjust", domain=m.group(1).strip(), change=m.group(2).strip()))
+
+    return instructions
 
 # -------------------------------
 # Routes
 # -------------------------------
 @app.post("/generate-budget")
 async def generate_budget(file: UploadFile = File(...), instructions: Optional[str] = None, adjustments: Optional[List[Adjustment]] = Body(None)):
-    # validate suffix
     suffix = os.path.splitext(file.filename)[1].lower()
     if suffix not in ALLOWED_SUFFIXES:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type '{suffix}'. Allowed: {ALLOWED_SUFFIXES}")
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '{suffix}'.")
 
-    # small file size guard (if file.size header not provided we read, but cap)
     content = await file.read()
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Uploaded file too large.")
-    # write to temp
+
     fd, tmp_file_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     try:
         with open(tmp_file_path, "wb") as f:
             f.write(content)
-        # process in threadpool
-        def process_and_generate():
-            # read file robustly
-            if suffix == ".csv":
-                raw = pd.read_csv(tmp_file_path)
-            else:
-                raw = pd.read_excel(tmp_file_path)
 
+        def process_and_generate():
+            raw = pd.read_csv(tmp_file_path) if suffix == ".csv" else pd.read_excel(tmp_file_path)
             df = normalize_columns(raw)
             weekly_df = aggregate_weekly(df)
 
-            # determine adjustments: explicit adjustments param > request body 'adjustments' (we accept both), then instructions
-            adjustments_list = adjustments or []
+            instructions_list: List[Instruction] = []
             if instructions and instructions.strip():
-                adjustments_from_text = parse_user_instructions(instructions)
-                # append parsed ones (but don't duplicate)
-                for a in adjustments_from_text:
-                    if not any((a.domain.lower() == ex.domain.lower() and a.change == ex.change) for ex in adjustments_list):
-                        adjustments_list.append(a)
+                instructions_list.extend(parse_user_instructions(instructions))
+            if adjustments:
+                for a in adjustments:
+                    instructions_list.append(Instruction(action="adjust", domain=a.domain, change=a.change))
 
             warnings = []
-            if adjustments_list:
-                weekly_df, warn = apply_json_adjustments(weekly_df, adjustments_list)
+            if instructions_list:
+                weekly_df, warn = apply_instructions(weekly_df, instructions_list)
                 warnings.extend(warn)
 
             summary_df = summarize_spending(weekly_df)
             tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
-            generate_budget_pdf(weekly_df, summary_df, tmp_pdf_file)
+            generate_budget_pdf(weekly_df, summary_df, tmp_pdf_file, instructions or "", warnings)
             return tmp_pdf_file, warnings
 
         tmp_pdf_file, warnings = await run_in_threadpool(process_and_generate)
@@ -418,17 +417,13 @@ async def generate_budget(file: UploadFile = File(...), instructions: Optional[s
             response["warnings"] = warnings
         return response
     finally:
-        try:
-            if os.path.exists(tmp_file_path):
-                os.remove(tmp_file_path)
-        except Exception:
-            logger.exception("Failed to remove temp upload file")
+        if os.path.exists(tmp_file_path):
+            os.remove(tmp_file_path)
 
 @app.post("/generate-budget-url")
 async def generate_budget_url(request: BudgetRequest):
     if not request.file_url:
         raise HTTPException(status_code=400, detail="file_url is required")
-    # fetch securely
     try:
         resp = requests.get(request.file_url, timeout=REQUEST_TIMEOUT)
     except Exception as e:
@@ -436,12 +431,10 @@ async def generate_budget_url(request: BudgetRequest):
     if resp.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Could not download file: HTTP {resp.status_code}")
 
-    # check content length (if provided)
     cl = resp.headers.get("Content-Length")
     if cl and int(cl) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Remote file too large")
 
-    # write to tmp
     fd, tmp_file_path = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
     try:
@@ -453,22 +446,21 @@ async def generate_budget_url(request: BudgetRequest):
             df = normalize_columns(raw)
             weekly_df = aggregate_weekly(df)
 
-            # parse instructions into adjustments if present
-            adjustments_list = request.adjustments or []
-            if request.instructions:
-                parsed = parse_user_instructions(request.instructions)
-                for a in parsed:
-                    if not any((a.domain.lower() == ex.domain.lower() and a.change == ex.change) for ex in adjustments_list):
-                        adjustments_list.append(a)
+            instructions_list: List[Instruction] = []
+            if request.instructions and request.instructions.strip():
+                instructions_list.extend(parse_user_instructions(request.instructions))
+            if request.adjustments:
+                for a in request.adjustments:
+                    instructions_list.append(Instruction(action="adjust", domain=a.domain, change=a.change))
 
             warnings = []
-            if adjustments_list:
-                weekly_df, warn = apply_json_adjustments(weekly_df, adjustments_list)
+            if instructions_list:
+                weekly_df, warn = apply_instructions(weekly_df, instructions_list)
                 warnings.extend(warn)
 
             summary_df = summarize_spending(weekly_df)
             tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
-            generate_budget_pdf(weekly_df, summary_df, tmp_pdf_file)
+            generate_budget_pdf(weekly_df, summary_df, tmp_pdf_file, request.instructions or "", warnings)
             return tmp_pdf_file, warnings
 
         tmp_pdf_file, warnings = await run_in_threadpool(process_and_generate)
@@ -477,11 +469,8 @@ async def generate_budget_url(request: BudgetRequest):
             response["warnings"] = warnings
         return response
     finally:
-        try:
-            if os.path.exists(tmp_file_path):
-                os.remove(tmp_file_path)
-        except Exception:
-            logger.exception("Failed to remove temp download file")
+        if os.path.exists(tmp_file_path):
+            os.remove(tmp_file_path)
 
 @app.get("/download/{file_name}")
 def download_file(file_name: str):
