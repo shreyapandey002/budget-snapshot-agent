@@ -245,7 +245,7 @@ async def generate_budget(
 
         forecasts, constraints, goals = parse_user_instructions(instructions)
 
-        final_df = apply_forecasts_constraints_goals(weekely_df, forecasts, constraints, goals)
+        final_df = apply_forecasts_constraints_goals(weekly_df, forecasts, constraints, goals)
         
 
         # Apply JSON adjustments first (if provided)
