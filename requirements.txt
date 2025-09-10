@@ -4,3 +4,4 @@ pandas
 fpdf
 python-multipart
 openpyxl
+requests
