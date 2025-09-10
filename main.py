@@ -34,7 +34,6 @@ def normalize_columns(df: pd.DataFrame):
 
     df = df.rename(columns=col_map)
 
-    # Check required columns
     if "date" not in df.columns:
         raise ValueError("Missing required column: date")
     if "department" not in df.columns:
@@ -42,7 +41,6 @@ def normalize_columns(df: pd.DataFrame):
     if "amount" not in df.columns:
         raise ValueError("Missing required column: amount")
 
-    # If tax exists → add to amount
     if "tax" in df.columns:
         df["amount"] = df["amount"] + df["tax"]
 
@@ -90,7 +88,6 @@ def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, 
     df = df.copy()
     constrained_depts = set()
 
-    # Constraints
     for c in constraints or []:
         c_lower = c.lower()
         for dept in df["department"].unique():
@@ -100,7 +97,6 @@ def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, 
                 if numbers:
                     df.loc[df["department"] == dept, "after_budget"] *= (1 - numbers[0] / 100)
 
-    # Forecasts
     for f in forecasts or []:
         f_lower = f.lower()
         if "revenue" in f_lower or "profit" in f_lower or "growth" in f_lower:
@@ -109,7 +105,6 @@ def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, 
                 multiplier = 1 + numbers[0] / 100
                 df.loc[~df["department"].isin(constrained_depts), "after_budget"] *= multiplier
 
-    # Goals
     for g in goals or []:
         g_lower = g.lower()
         for dept in df["department"].unique():
@@ -126,6 +121,7 @@ def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, 
 
 # ---------- Apply JSON Adjustments ----------
 def apply_json_adjustments(df: pd.DataFrame, adjustments: list):
+    df = df.copy()
     for adj in adjustments:
         dept = adj.get("domain", "").lower()
         change = adj.get("change", "").strip()
@@ -133,20 +129,25 @@ def apply_json_adjustments(df: pd.DataFrame, adjustments: list):
         if not dept or not change:
             continue
 
-        # Clean % value
-        if "%" in change:
-            num = float(change.replace("%", "").replace("+", "").replace("-", ""))
-            factor = 1 + (num / 100) if change.startswith("+") else 1 - (num / 100)
+        ### FIXED: Proper handling of +, -, %
+        if change.endswith("%"):
+            try:
+                percent = float(change.strip("%").replace("+", "").replace("-", ""))
+            except:
+                continue
+            if change.startswith("-"):
+                factor = 1 - (percent / 100)
+            else:  # + or no sign
+                factor = 1 + (percent / 100)
         else:
             try:
-                num = float(change)
-                factor = 1 + (num / 100)
+                delta = float(change)
+                factor = 1 + (delta / 100)
             except:
                 continue
 
-        # Apply to matching department
         mask = df["department"].str.lower() == dept
-        df.loc[mask, "after_budget"] *= factor
+        df.loc[mask, "after_budget"] = (df.loc[mask, "after_budget"] * factor).round(2)
 
     return df
 
@@ -168,11 +169,9 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
     pdf = FPDF()
     pdf.add_page()
 
-    # Title
     pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, "Budget Snapshot Report", 0, 1, "C")
 
-    # Section 1: Weekly Breakdown
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Weekly Budget Breakdown", 0, 1)
 
@@ -199,7 +198,6 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
             pdf.cell(w, 8, str(v), 1)
         pdf.ln()
 
-    # Section 2: Department Summary
     pdf.ln(10)
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Department Summary", 0, 1)
@@ -252,7 +250,6 @@ async def generate_budget(
         forecasts, constraints, goals = parse_user_instructions(instructions)
         final_df = apply_forecasts_constraints_goals(weekly_df, forecasts, constraints, goals)
 
-        # Apply JSON adjustments
         if adjustments:
             try:
                 adj_obj = json.loads(adjustments)
