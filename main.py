@@ -66,20 +66,36 @@ def aggregate_weekly(df: pd.DataFrame):
 
 # ---------- Instruction Parser ----------
 def parse_user_instructions(user_text: str):
+    """
+    Splits user instructions into three categories:
+    - forecasts: high-level revenue/profit/growth targets
+    - constraints: reductions (reduce, cut, decrease)
+    - goals: increases (increase, boost, raise, expand)
+    """
+
     parts = [p.strip() for p in user_text.replace("and", ",").split(",")]
     forecasts, constraints, goals = [], [], []
 
     for p in parts:
         p_lower = p.lower()
-        if "revenue" in p_lower or "profit" in p_lower or "growth" in p_lower:
+
+        # Forecasts (apply to overall company level)
+        if any(keyword in p_lower for keyword in ["revenue", "profit", "growth"]):
             forecasts.append(p)
-        elif "%" in p_lower or "reduce" in p_lower or "cut" in p_lower:
+
+        # Explicit constraints (reductions)
+        elif any(keyword in p_lower for keyword in ["reduce", "cut", "decrease"]):
             constraints.append(p)
-        else:
+
+        # Explicit goals (increases)
+        elif any(keyword in p_lower for keyword in ["increase", "boost", "raise", "expand"]):
+            goals.append(p)
+
+        # Fallback: if contains a %, but no clear verb → treat as goal
+        elif "%" in p_lower:
             goals.append(p)
 
     return forecasts, constraints, goals
-
 
 # ---------- Apply Logic ----------
 def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, goals):
