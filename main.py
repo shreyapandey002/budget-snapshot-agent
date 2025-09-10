@@ -10,7 +10,6 @@ from starlette.concurrency import run_in_threadpool
 from typing import Optional
 import json
 
-
 app = FastAPI(title="Budget Snapshot Agent")
 
 # --------------------------------------
@@ -63,49 +62,55 @@ def aggregate_weekly(df: pd.DataFrame):
         .reset_index()
     )
     weekly_df.rename(columns={"amount": "before_budget"}, inplace=True)
+    weekly_df["after_budget"] = weekly_df["before_budget"].copy()
     return weekly_df
 
 
 # ---------- Instruction Parser ----------
 def parse_user_instructions(user_text: str):
-    """
-    Splits user instructions into three categories:
-    - forecasts: high-level revenue/profit/growth targets
-    - constraints: reductions (reduce, cut, decrease)
-    - goals: increases (increase, boost, raise, expand)
-    """
-
     parts = [p.strip() for p in user_text.replace("and", ",").split(",")]
     forecasts, constraints, goals = [], [], []
 
     for p in parts:
         p_lower = p.lower()
-
-        # Forecasts (apply to overall company level)
         if any(keyword in p_lower for keyword in ["revenue", "profit", "growth"]):
             forecasts.append(p)
-
-        # Explicit constraints (reductions)
         elif any(keyword in p_lower for keyword in ["reduce", "cut", "decrease"]):
             constraints.append(p)
-
-        # Explicit goals (increases)
         elif any(keyword in p_lower for keyword in ["increase", "boost", "raise", "expand"]):
             goals.append(p)
-
-        # Fallback: if contains a %, but no clear verb → treat as goal
         elif "%" in p_lower:
             goals.append(p)
 
     return forecasts, constraints, goals
 
-# ---------- Apply Logic ----------
+
+# ---------- Apply JSON Adjustments ----------
+def apply_adjustments(df: pd.DataFrame, adjustments: list):
+    df = df.copy()
+    for adj in adjustments or []:
+        dept = str(adj.get("domain", "")).strip().lower()
+        change = str(adj.get("change", "")).strip()
+        if not dept or not change:
+            continue
+
+        try:
+            num = float(change.replace("%", "").replace("+", "").replace("-", ""))
+        except Exception:
+            continue
+
+        if "%" in change:
+            if change.startswith("-"):
+                df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 - num / 100)
+            elif change.startswith("+"):
+                df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 + num / 100)
+    return df
+
+
+# ---------- Apply Natural Language ----------
 def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, goals):
-    df["after_budget"] = df["before_budget"].copy()
-    
-    # -----------------------
-    # Step 1: Apply constraints (only if % is specified)
-    # -----------------------
+    df = df.copy()
+    # Constraints
     constrained_depts = set()
     for c in constraints or []:
         c_lower = c.lower()
@@ -116,9 +121,7 @@ def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, 
                 if numbers:
                     df.loc[df["department"] == dept, "after_budget"] *= (1 - numbers[0] / 100)
 
-    # -----------------------
-    # Step 2: Apply forecasts to non-constrained depts (only if % is specified)
-    # -----------------------
+    # Forecasts
     for f in forecasts or []:
         f_lower = f.lower()
         if "revenue" in f_lower or "profit" in f_lower or "growth" in f_lower:
@@ -127,9 +130,7 @@ def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, 
                 multiplier = 1 + numbers[0] / 100
                 df.loc[~df["department"].isin(constrained_depts), "after_budget"] *= multiplier
 
-    # -----------------------
-    # Step 3: Apply goals (only if % is specified)
-    # -----------------------
+    # Goals
     for g in goals or []:
         g_lower = g.lower()
         for dept in df["department"].unique():
@@ -141,20 +142,8 @@ def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, 
                     elif "decrease" in g_lower or "reduce" in g_lower:
                         df.loc[df["department"] == dept, "after_budget"] *= (1 - numbers[0] / 100)
 
-    # -----------------------
-    # Step 4: Hybrid rebalance (only non-constrained departments)
-    # -----------------------
-    if constrained_depts:
-        total_before = df["before_budget"].sum()
-        constrained_before = df.loc[df["department"].isin(constrained_depts), "before_budget"].sum()
-        constrained_after = df.loc[df["department"].isin(constrained_depts), "after_budget"].sum()
-
-        remaining_after = df.loc[~df["department"].isin(constrained_depts), "after_budget"].sum()
-        if remaining_after > 0:
-            rebalancer = (total_before - constrained_after) / remaining_after
-            df.loc[~df["department"].isin(constrained_depts), "after_budget"] *= rebalancer
-
     return df
+
 
 def summarize_department_spending(df: pd.DataFrame):
     summary = (
@@ -177,22 +166,18 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
     pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, "Budget Snapshot Report", 0, 1, "C")
 
-    # -------------------------
     # Section 1: Weekly Breakdown
-    # -------------------------
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Weekly Budget Breakdown", 0, 1)
 
     headers = ["Department", "Week Range", "Before", "After", "% Change"]
     col_widths = [40, 60, 30, 30, 30]
 
-    # Headers
     pdf.set_font("Arial", "B", 10)
     for h, w in zip(headers, col_widths):
         pdf.cell(w, 8, h, 1)
     pdf.ln()
 
-    # Rows
     pdf.set_font("Arial", "", 10)
     for _, row in weekly_df.iterrows():
         week_range = f"{row['week_start'].strftime('%Y-%m-%d')} to {row['week_end'].strftime('%Y-%m-%d')}"
@@ -208,10 +193,7 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
             pdf.cell(w, 8, str(v), 1)
         pdf.ln()
 
-
-    # -------------------------
     # Section 2: Department Summary
-    # -------------------------
     pdf.ln(10)
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Department Summary", 0, 1)
@@ -219,13 +201,11 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
     headers = ["Department", "Total Before", "Total After", "% Change"]
     col_widths = [60, 40, 40, 40]
 
-    # Headers
     pdf.set_font("Arial", "B", 10)
     for h, w in zip(headers, col_widths):
         pdf.cell(w, 8, h, 1)
     pdf.ln()
 
-    # Rows
     pdf.set_font("Arial", "", 10)
     for _, row in summary_df.iterrows():
         values = [
@@ -246,16 +226,12 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
 async def generate_budget(
     file: UploadFile,
     instructions: str = Form(""),
-    adjustments: Optional[str] = Form(None)   # <-- new field
+    adjustments: Optional[str] = Form(None)
 ):
     suffix = os.path.splitext(file.filename)[1]
     if suffix.lower() not in [".xls", ".xlsx"]:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Only Excel files are supported."}
-        )
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Only Excel files are supported."})
 
-    # Save uploaded Excel temporarily
     fd, tmp_file_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     content = await file.read()
@@ -267,32 +243,21 @@ async def generate_budget(
         df = normalize_columns(df)
         weekly_df = aggregate_weekly(df)
 
-        # Parse both instructions and structured adjustments
-        forecasts, constraints, goals = parse_user_instructions(instructions)
-
+        # Apply JSON adjustments first (if provided)
         if adjustments:
             try:
                 adj_obj = json.loads(adjustments)
-                # Example: apply structured adjustments in addition to text
-                for adj in adj_obj.get("adjustments", []):
-                    dept = adj.get("domain", "").lower()
-                    change = adj.get("change", "")
-                    if "%" in change:
-                        num = int(change.strip("%").replace("+", "").replace("-", ""))
-                        if change.startswith("-"):
-                            df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 - num/100)
-                        elif change.startswith("+"):
-                            df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 + num/100)
+                weekly_df = apply_adjustments(weekly_df, adj_obj.get("adjustments", []))
             except Exception as e:
                 print("Invalid adjustments JSON:", e)
 
-        final_df = apply_forecasts_constraints_goals(weekly_df, forecasts, constraints, goals)
-        summary_df = summarize_department_spending(final_df)
+        # Apply natural language instructions too (optional, fallback)
+        forecasts, constraints, goals = parse_user_instructions(instructions)
+        weekly_df = apply_forecasts_constraints_goals(weekly_df, forecasts, constraints, goals)
 
-        tmp_pdf_file = os.path.join(
-            tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf"
-        )
-        generate_budget_pdf(final_df, summary_df, tmp_pdf_file)
+        summary_df = summarize_department_spending(weekly_df)
+        tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
+        generate_budget_pdf(weekly_df, summary_df, tmp_pdf_file)
         return tmp_pdf_file
 
     try:
