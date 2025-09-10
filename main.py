@@ -85,33 +85,12 @@ def parse_user_instructions(user_text: str):
     return forecasts, constraints, goals
 
 
-# ---------- Apply JSON Adjustments ----------
-def apply_adjustments(df: pd.DataFrame, adjustments: list):
-    df = df.copy()
-    for adj in adjustments or []:
-        dept = str(adj.get("domain", "")).strip().lower()
-        change = str(adj.get("change", "")).strip()
-        if not dept or not change:
-            continue
-
-        try:
-            num = float(change.replace("%", "").replace("+", "").replace("-", ""))
-        except Exception:
-            continue
-
-        if "%" in change:
-            if change.startswith("-"):
-                df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 - num / 100)
-            elif change.startswith("+"):
-                df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 + num / 100)
-    return df
-
-
 # ---------- Apply Natural Language ----------
 def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, goals):
     df = df.copy()
-    # Constraints
     constrained_depts = set()
+
+    # Constraints
     for c in constraints or []:
         c_lower = c.lower()
         for dept in df["department"].unique():
@@ -145,6 +124,28 @@ def apply_forecasts_constraints_goals(df: pd.DataFrame, forecasts, constraints, 
     return df
 
 
+# ---------- Apply JSON Adjustments ----------
+def apply_json_adjustments(df, adjustments):
+    try:
+        for adj in adjustments.get("adjustments", []):
+            dept = adj.get("domain", "").lower()
+            change = adj.get("change", "")
+            if not dept or not change:
+                continue
+
+            if "%" in change:
+                num = float(change.strip("%").replace("+", "").replace("-", ""))
+                if change.startswith("-"):
+                    df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 - num / 100)
+                else:
+                    df.loc[df["department"].str.lower() == dept, "after_budget"] *= (1 + num / 100)
+    except Exception as e:
+        print("Invalid adjustments JSON:", e)
+
+    return df
+
+
+# ---------- Summaries ----------
 def summarize_department_spending(df: pd.DataFrame):
     summary = (
         df.groupby("department")[["before_budget", "after_budget"]]
@@ -181,7 +182,10 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
     pdf.set_font("Arial", "", 10)
     for _, row in weekly_df.iterrows():
         week_range = f"{row['week_start'].strftime('%Y-%m-%d')} to {row['week_end'].strftime('%Y-%m-%d')}"
-        percent_change = ((row['after_budget'] - row['before_budget']) / row['before_budget'] * 100) if row['before_budget'] else 0
+        percent_change = (
+            (row['after_budget'] - row['before_budget']) / row['before_budget'] * 100
+            if row['before_budget'] else 0
+        )
         values = [
             row["department"],
             week_range,
@@ -243,28 +247,20 @@ async def generate_budget(
         df = normalize_columns(df)
         weekly_df = aggregate_weekly(df)
 
+        # Apply natural language
         forecasts, constraints, goals = parse_user_instructions(instructions)
-
         final_df = apply_forecasts_constraints_goals(weekly_df, forecasts, constraints, goals)
-        
 
-        # Apply JSON adjustments first (if provided)
+        # Apply JSON adjustments
         if adjustments:
             try:
                 adj_obj = json.loads(adjustments)
-                for adj in adj_obj.get("adjustments", []):
-                    dept = adj.get("domain", "").lower()
-                    change = adj.get("change", "")
-                    if "%" in change:
-                        num = int(change.strip("%").replace("+", "").replace("-", ""))
-                        if change.startswith("-"):
-                           final_df.loc[final_df["department"].str.lower() == dept, "after_budget"] *= (1 - num / 100)
-                        elif change.startswith("+"):
-                            final_df.loc[final_df["department"].str.lower() == dept, "after_budget"] *= (1 + num / 100)
+                final_df = apply_json_adjustments(final_df, adj_obj)
             except Exception as e:
                 print("Invalid adjustments JSON:", e)
 
         summary_df = summarize_department_spending(final_df)
+
         tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
         generate_budget_pdf(final_df, summary_df, tmp_pdf_file)
         return tmp_pdf_file
