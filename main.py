@@ -34,7 +34,7 @@ class Adjustment(BaseModel):
 class Instruction(BaseModel):
     action: str  # "adjust", "remove", "allocate", "headcount"
     domain: Optional[str] = None
-    target: Optional[str] = None   # for merge target (unused)
+    target: Optional[str] = None   # unused
     change: Optional[str] = None   # "+10%", "-5%" for adjust/headcount
     percent: Optional[float] = None  # for allocate
 
@@ -100,19 +100,22 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
-    df["month_name"] = df["month"].dt.strftime("%B %Y")  # e.g., "September 2025"
-    
-    group_cols = ["department", "month_name"]
+    df["month_name"] = df["month"].dt.strftime("%B %Y")
+
+    group_cols = ["department", "month"]
     if "expense_category" in df.columns:
         group_cols.insert(1, "expense_category")
-    
+
     monthly_df = df.groupby(group_cols)["amount"].sum().reset_index()
     monthly_df = monthly_df.rename(columns={"amount": "previous_year"})
     monthly_df["this_year"] = monthly_df["previous_year"].astype(float).copy()
-    
+    monthly_df["month_name"] = monthly_df["month"].dt.strftime("%B %Y")
+
     return monthly_df
 
-# ---- Adjustment parsing / utilities ----
+# -------------------------------
+# Adjustment parsing / utilities
+# -------------------------------
 PCT_RE = re.compile(r"^([+-]?\s*\d+(\.\d+)?)\s*%?$")
 
 def parse_change_to_factor(change: str) -> Optional[float]:
@@ -187,10 +190,12 @@ def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tup
     return df, warnings
 
 def summarize_spending(df: pd.DataFrame) -> pd.DataFrame:
-    group_cols = ["department", "month_name"]
+    group_cols = ["department", "month"]
     if "expense_category" in df.columns:
         group_cols.insert(1, "expense_category")
     summary = df.groupby(group_cols)[["previous_year", "this_year"]].sum().reset_index()
+
+    summary["month_name"] = summary["month"].dt.strftime("%B %Y")
 
     def pct_change(prev, this):
         if prev == 0:
@@ -198,6 +203,7 @@ def summarize_spending(df: pd.DataFrame) -> pd.DataFrame:
         return round((this - prev) / prev * 100, 2)
 
     summary["percent_change"] = summary.apply(lambda r: pct_change(r["previous_year"], r["this_year"]), axis=1)
+    summary = summary.sort_values(["month", "department", "expense_category" if "expense_category" in summary.columns else None])
     return summary
 
 # -------------------------------
@@ -254,13 +260,28 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
         headers.append("Category")
     headers.append("Month")
     headers += ["Previous Year", "This Year", "% Change"]
-
     col_widths = [50, 40, 50, 35, 35, 30] if "expense_category" in summary_df.columns else [60, 50, 35, 35, 30]
 
     rows = []
+    last_month = None
+    month_totals = {"previous_year": 0.0, "this_year": 0.0}
     for _, r in summary_df.iterrows():
+        # Add grand total row if month changes
+        if last_month and last_month != r["month_name"]:
+            pct = "∞" if month_totals["previous_year"] == 0 and month_totals["this_year"] > 0 else 0.0 if month_totals["previous_year"] == 0 else round((month_totals["this_year"] - month_totals["previous_year"]) / month_totals["previous_year"] * 100, 2)
+            total_row = ["GRAND TOTAL"]
+            if "expense_category" in summary_df.columns:
+                total_row.append("")
+            total_row.append(last_month)
+            total_row += [f"{month_totals['previous_year']:,.2f}", f"{month_totals['this_year']:,.2f}", f"{pct}%"]
+            rows.append(total_row)
+            month_totals = {"previous_year": 0.0, "this_year": 0.0}
+
         prev = float(r["previous_year"])
         this = float(r["this_year"])
+        month_totals["previous_year"] += prev
+        month_totals["this_year"] += this
+
         pct = "∞" if prev == 0 and this > 0 else 0.0 if prev == 0 else round((this - prev) / prev * 100, 2)
 
         vals = [r["department"]]
@@ -269,6 +290,17 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
         vals.append(r["month_name"])
         vals += [f"{prev:,.2f}", f"{this:,.2f}", f"{pct}%"]
         rows.append(vals)
+        last_month = r["month_name"]
+
+    # add final month total
+    if last_month:
+        pct = "∞" if month_totals["previous_year"] == 0 and month_totals["this_year"] > 0 else 0.0 if month_totals["previous_year"] == 0 else round((month_totals["this_year"] - month_totals["previous_year"]) / month_totals["previous_year"] * 100, 2)
+        total_row = ["GRAND TOTAL"]
+        if "expense_category" in summary_df.columns:
+            total_row.append("")
+        total_row.append(last_month)
+        total_row += [f"{month_totals['previous_year']:,.2f}", f"{month_totals['this_year']:,.2f}", f"{pct}%"]
+        rows.append(total_row)
 
     _paged_table_to_pdf(pdf, headers, rows, col_widths)
     pdf.output(output_path)
