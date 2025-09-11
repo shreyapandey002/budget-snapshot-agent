@@ -251,9 +251,9 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
         pdf.multi_cell(0, 6, "Warnings:\n" + "\n".join(warnings))
     pdf.ln(5)
 
-    # Summary table
+    # 1️⃣ Monthly Summary Table
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Department Summary", 0, 1)
+    pdf.cell(0, 10, "Monthly Department Summary", 0, 1)
 
     headers = ["Department"]
     if "expense_category" in summary_df.columns:
@@ -265,25 +265,24 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
     rows = []
     last_month = None
     month_totals = {"previous_year": 0.0, "this_year": 0.0}
+
     for _, r in summary_df.iterrows():
-        # Add grand total row if month changes
         if last_month and last_month != r["month_name"]:
-            pct = "∞" if month_totals["previous_year"] == 0 and month_totals["this_year"] > 0 else 0.0 if month_totals["previous_year"] == 0 else round((month_totals["this_year"] - month_totals["previous_year"]) / month_totals["previous_year"] * 100, 2)
+            pct = 0.0 if month_totals["previous_year"]==0 else round((month_totals["this_year"]-month_totals["previous_year"])/month_totals["previous_year"]*100,2)
             total_row = ["GRAND TOTAL"]
             if "expense_category" in summary_df.columns:
                 total_row.append("")
             total_row.append(last_month)
             total_row += [f"{month_totals['previous_year']:,.2f}", f"{month_totals['this_year']:,.2f}", f"{pct}%"]
             rows.append(total_row)
-            month_totals = {"previous_year": 0.0, "this_year": 0.0}
+            month_totals = {"previous_year":0.0,"this_year":0.0}
 
         prev = float(r["previous_year"])
         this = float(r["this_year"])
         month_totals["previous_year"] += prev
         month_totals["this_year"] += this
 
-        pct = "∞" if prev == 0 and this > 0 else 0.0 if prev == 0 else round((this - prev) / prev * 100, 2)
-
+        pct = 0.0 if prev==0 else round((this-prev)/prev*100,2)
         vals = [r["department"]]
         if "expense_category" in summary_df.columns:
             vals.append(r["expense_category"])
@@ -292,9 +291,9 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
         rows.append(vals)
         last_month = r["month_name"]
 
-    # add final month total
+    # final month total
     if last_month:
-        pct = "∞" if month_totals["previous_year"] == 0 and month_totals["this_year"] > 0 else 0.0 if month_totals["previous_year"] == 0 else round((month_totals["this_year"] - month_totals["previous_year"]) / month_totals["previous_year"] * 100, 2)
+        pct = 0.0 if month_totals["previous_year"]==0 else round((month_totals["this_year"]-month_totals["previous_year"])/month_totals["previous_year"]*100,2)
         total_row = ["GRAND TOTAL"]
         if "expense_category" in summary_df.columns:
             total_row.append("")
@@ -303,7 +302,27 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
         rows.append(total_row)
 
     _paged_table_to_pdf(pdf, headers, rows, col_widths)
+
+    # 2️⃣ Yearly Summary
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, "Yearly Summary", 0, 1)
+
+    yearly_prev = summary_df["previous_year"].sum()
+    yearly_this = summary_df["this_year"].sum()
+    yearly_pct = 0.0 if yearly_prev==0 else round((yearly_this-yearly_prev)/yearly_prev*100,2)
+
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(50, 10, "Previous Year", 1)
+    pdf.cell(50, 10, "This Year", 1)
+    pdf.cell(50, 10, "% Change", 1)
+    pdf.ln()
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(50, 10, f"{yearly_prev:,.2f}", 1)
+    pdf.cell(50, 10, f"{yearly_this:,.2f}", 1)
+    pdf.cell(50, 10, f"{yearly_pct}%", 1)
     pdf.output(output_path)
+    
 
 # -------------------------------
 # Instruction parser
