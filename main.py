@@ -11,7 +11,6 @@ from datetime import timedelta
 from starlette.concurrency import run_in_threadpool
 import requests
 import logging
-import math
 import re
 
 # ----- Config -----
@@ -134,47 +133,29 @@ def match_mask_for_domain(df: pd.DataFrame, domain: str) -> pd.Series:
         mask_cat = df["expense_category"].astype(str).str.lower() == domain_clean
     return mask_dept | mask_cat
 
-def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tuple[pd.DataFrame, List[str]]:
-    df = df.copy()
+# -------------------------------
+# Yearly adjustments applied here
+# -------------------------------
+def summarize_spending(df: pd.DataFrame, instructions: List[Instruction]) -> Tuple[pd.DataFrame, List[str]]:
     warnings = []
+    yearly = df.groupby("department")[["previous_year","this_year"]].sum().reset_index()
 
-    for instr in [i for i in instructions if i.action == "remove"]:
-        mask = match_mask_for_domain(df, instr.domain)
-        if not mask.any():
-            warnings.append(f"No rows matched to remove '{instr.domain}'")
-            continue
-        df = df.loc[~mask].reset_index(drop=True)
-
-    for instr in [i for i in instructions if i.action == "allocate"]:
-        mask = match_mask_for_domain(df, instr.domain)
-        if not mask.any():
-            warnings.append(f"No rows matched to allocate to '{instr.domain}'")
-            continue
-        df.loc[mask, "this_year"] = (instr.percent / 100.0) * df["previous_year"].sum()
-
-    for instr in [i for i in instructions if i.action in ["headcount", "adjust"]]:
+    # Apply department-level adjustments
+    for instr in [i for i in instructions if i.action in ["adjust", "headcount"]]:
         factor = parse_change_to_factor(instr.change)
         if factor is None:
             warnings.append(f"Invalid change '{instr.change}' for {instr.domain}")
             continue
-        mask = match_mask_for_domain(df, instr.domain)
+        mask = yearly["department"].astype(str).str.lower() == instr.domain.lower()
         if not mask.any():
-            warnings.append(f"No rows matched for {instr.action} '{instr.domain}'")
+            warnings.append(f"No department matched '{instr.domain}' in yearly summary")
             continue
-        df.loc[mask, "this_year"] *= factor
+        yearly.loc[mask, "this_year"] *= factor
 
-    df["this_year"] = df["this_year"].clip(lower=0)
-    return df, warnings
-
-def summarize_spending(df: pd.DataFrame) -> pd.DataFrame:
-    group_cols = ["department", "month_name"]
-    if "expense_category" in df.columns:
-        group_cols.insert(1, "expense_category")
-    summary = df.groupby(group_cols)[["previous_year", "this_year"]].sum().reset_index()
-    return summary
+    return yearly, warnings
 
 # -------------------------------
-# PDF / Reporting (Updated)
+# PDF / Reporting
 # -------------------------------
 def _paged_table_to_pdf(pdf: FPDF, headers: List[str], rows: List[List[str]], col_widths: List[int], font_size=9):
     pdf.set_font("Arial", "", font_size)
@@ -238,7 +219,7 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
     pdf.add_page()
     pdf.set_font("Arial", "B", 14)
     pdf.cell(0, 10, "Yearly Summary", 0, 1)
-    yearly_summary = df.groupby("department")[["previous_year","this_year"]].sum().reset_index()
+    yearly_summary = summary_df.copy()
     yearly_summary["percent_change"] = yearly_summary.apply(
         lambda r: round((r["this_year"]-r["previous_year"])/r["previous_year"]*100,2)
         if r["previous_year"]!=0 else ("∞" if r["this_year"]>0 else 0), axis=1)
@@ -256,7 +237,6 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
     _paged_table_to_pdf(pdf, headers, rows, col_widths)
 
     pdf.output(output_path)
-
 
 # -------------------------------
 # Instruction parser
@@ -331,10 +311,8 @@ async def generate_budget(file: UploadFile = File(...), instructions: Optional[s
                 for a in adjustments:
                     instructions_list.append(Instruction(action="adjust", domain=a.domain, change=a.change))
             warnings=[]
-            if instructions_list:
-                monthly_df, warn = apply_instructions(monthly_df, instructions_list)
-                warnings.extend(warn)
-            summary_df = summarize_spending(monthly_df)
+            summary_df, warn2 = summarize_spending(monthly_df, instructions_list)
+            warnings.extend(warn2)
             tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
             generate_budget_pdf(monthly_df, summary_df, tmp_pdf_file, instructions or "", warnings)
             return tmp_pdf_file, warnings
@@ -379,10 +357,8 @@ async def generate_budget_url(request: BudgetRequest):
                 for a in request.adjustments:
                     instructions_list.append(Instruction(action="adjust", domain=a.domain, change=a.change))
             warnings=[]
-            if instructions_list:
-                monthly_df, warn = apply_instructions(monthly_df, instructions_list)
-                warnings.extend(warn)
-            summary_df = summarize_spending(monthly_df)
+            summary_df, warn2 = summarize_spending(monthly_df, instructions_list)
+            warnings.extend(warn2)
             tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
             generate_budget_pdf(monthly_df, summary_df, tmp_pdf_file, request.instructions or "", warnings)
             return tmp_pdf_file, warnings
