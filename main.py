@@ -34,7 +34,7 @@ class Adjustment(BaseModel):
 class Instruction(BaseModel):
     action: str  # "adjust", "remove", "allocate", "headcount"
     domain: Optional[str] = None
-    target: Optional[str] = None   # unused
+    target: Optional[str] = None   # for merge target (unused)
     change: Optional[str] = None   # "+10%", "-5%" for adjust/headcount
     percent: Optional[float] = None  # for allocate
 
@@ -71,7 +71,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.rename(columns=col_map)
 
-    # required checks
     if "date" not in df.columns:
         raise ValueError("Missing required column: date")
     if "department" not in df.columns:
@@ -79,7 +78,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "amount" not in df.columns:
         raise ValueError("Missing required column: amount (or synonyms)")
 
-    # if tax exists: add to amount
     if "tax" in df.columns:
         df["tax"] = pd.to_numeric(df["tax"], errors="coerce").fillna(0.0)
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0) + df["tax"]
@@ -101,21 +99,18 @@ def aggregate_monthly(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
     df["month_name"] = df["month"].dt.strftime("%B %Y")
-
-    group_cols = ["department", "month"]
+    
+    group_cols = ["department", "month_name"]
     if "expense_category" in df.columns:
         group_cols.insert(1, "expense_category")
-
+    
     monthly_df = df.groupby(group_cols)["amount"].sum().reset_index()
     monthly_df = monthly_df.rename(columns={"amount": "previous_year"})
     monthly_df["this_year"] = monthly_df["previous_year"].astype(float).copy()
-    monthly_df["month_name"] = monthly_df["month"].dt.strftime("%B %Y")
-
+    
     return monthly_df
 
-# -------------------------------
-# Adjustment parsing / utilities
-# -------------------------------
+# ---- Adjustment parsing / utilities ----
 PCT_RE = re.compile(r"^([+-]?\s*\d+(\.\d+)?)\s*%?$")
 
 def parse_change_to_factor(change: str) -> Optional[float]:
@@ -144,7 +139,6 @@ def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tup
     warnings = []
     constrained_mask = pd.Series(False, index=df.index)
 
-    # Remove
     for instr in [i for i in instructions if i.action == "remove"]:
         mask = match_mask_for_domain(df, instr.domain)
         if not mask.any():
@@ -152,7 +146,6 @@ def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tup
             continue
         df = df.loc[~mask].reset_index(drop=True)
 
-    # Allocate
     total_before = df["previous_year"].sum()
     for instr in [i for i in instructions if i.action == "allocate"]:
         mask = match_mask_for_domain(df, instr.domain)
@@ -163,7 +156,6 @@ def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tup
         df.loc[mask, "this_year"] = target_share
         constrained_mask = constrained_mask | mask
 
-    # Headcount + Adjust
     for instr in [i for i in instructions if i.action in ["headcount", "adjust"]]:
         factor = parse_change_to_factor(instr.change)
         if factor is None:
@@ -176,7 +168,6 @@ def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tup
         df.loc[mask, "this_year"] *= factor
         constrained_mask = constrained_mask | mask
 
-    # Rebalance
     total_after_constrained = df.loc[constrained_mask, "this_year"].sum()
     remaining_after = df.loc[~constrained_mask, "this_year"].sum()
     if constrained_mask.any() and remaining_after > 0:
@@ -190,24 +181,14 @@ def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tup
     return df, warnings
 
 def summarize_spending(df: pd.DataFrame) -> pd.DataFrame:
-    group_cols = ["department", "month"]
+    group_cols = ["department", "month_name"]
     if "expense_category" in df.columns:
         group_cols.insert(1, "expense_category")
     summary = df.groupby(group_cols)[["previous_year", "this_year"]].sum().reset_index()
-
-    summary["month_name"] = summary["month"].dt.strftime("%B %Y")
-
-    def pct_change(prev, this):
-        if prev == 0:
-            return 0.0 if this == 0 else float("inf")
-        return round((this - prev) / prev * 100, 2)
-
-    summary["percent_change"] = summary.apply(lambda r: pct_change(r["previous_year"], r["this_year"]), axis=1)
-    summary = summary.sort_values(["month", "department", "expense_category" if "expense_category" in summary.columns else None])
     return summary
 
 # -------------------------------
-# PDF / Reporting
+# PDF / Reporting (Updated)
 # -------------------------------
 def _paged_table_to_pdf(pdf: FPDF, headers: List[str], rows: List[List[str]], col_widths: List[int], font_size=9):
     pdf.set_font("Arial", "", font_size)
@@ -242,7 +223,6 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
     pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, "Budget Snapshot Report", 0, 1, "C")
 
-    # Instructions + Warnings
     pdf.set_font("Arial", "B", 12)
     if instructions_text:
         pdf.multi_cell(0, 6, f"Instructions:\n{instructions_text}")
@@ -251,78 +231,58 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
         pdf.multi_cell(0, 6, "Warnings:\n" + "\n".join(warnings))
     pdf.ln(5)
 
-    # 1️⃣ Monthly Summary Table
+    # Monthly Analysis
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Monthly Department Summary", 0, 1)
+    pdf.cell(0, 10, "Monthly Analysis", 0, 1)
+    monthly_df = df.copy()
+    monthly_df["month_ts"] = pd.to_datetime(monthly_df["month_name"], format="%B %Y")
+    monthly_df = monthly_df.sort_values(["department", "expense_category" if "expense_category" in monthly_df.columns else "department", "month_ts"])
 
     headers = ["Department"]
-    if "expense_category" in summary_df.columns:
+    if "expense_category" in monthly_df.columns:
         headers.append("Category")
-    headers.append("Month")
-    headers += ["Previous Year", "This Year", "% Change"]
-    col_widths = [50, 40, 50, 35, 35, 30] if "expense_category" in summary_df.columns else [60, 50, 35, 35, 30]
+    headers += ["Month", "Previous Year", "This Year", "% Change"]
+    col_widths = [50, 40, 50, 35, 35, 30] if "expense_category" in monthly_df.columns else [60, 50, 35, 35, 30]
 
     rows = []
-    last_month = None
-    month_totals = {"previous_year": 0.0, "this_year": 0.0}
-
-    for _, r in summary_df.iterrows():
-        if last_month and last_month != r["month_name"]:
-            pct = 0.0 if month_totals["previous_year"]==0 else round((month_totals["this_year"]-month_totals["previous_year"])/month_totals["previous_year"]*100,2)
-            total_row = ["GRAND TOTAL"]
-            if "expense_category" in summary_df.columns:
-                total_row.append("")
-            total_row.append(last_month)
-            total_row += [f"{month_totals['previous_year']:,.2f}", f"{month_totals['this_year']:,.2f}", f"{pct}%"]
-            rows.append(total_row)
-            month_totals = {"previous_year":0.0,"this_year":0.0}
-
-        prev = float(r["previous_year"])
-        this = float(r["this_year"])
-        month_totals["previous_year"] += prev
-        month_totals["this_year"] += this
-
-        pct = 0.0 if prev==0 else round((this-prev)/prev*100,2)
-        vals = [r["department"]]
-        if "expense_category" in summary_df.columns:
-            vals.append(r["expense_category"])
-        vals.append(r["month_name"])
-        vals += [f"{prev:,.2f}", f"{this:,.2f}", f"{pct}%"]
-        rows.append(vals)
-        last_month = r["month_name"]
-
-    # final month total
-    if last_month:
-        pct = 0.0 if month_totals["previous_year"]==0 else round((month_totals["this_year"]-month_totals["previous_year"])/month_totals["previous_year"]*100,2)
-        total_row = ["GRAND TOTAL"]
-        if "expense_category" in summary_df.columns:
-            total_row.append("")
-        total_row.append(last_month)
-        total_row += [f"{month_totals['previous_year']:,.2f}", f"{month_totals['this_year']:,.2f}", f"{pct}%"]
-        rows.append(total_row)
-
+    for _, r in monthly_df.iterrows():
+        prev, this = r["previous_year"], r["this_year"]
+        pct = round((this-prev)/prev*100,2) if prev!=0 else ("∞" if this>0 else 0)
+        row = [r["department"]]
+        if "expense_category" in monthly_df.columns:
+            row.append(r["expense_category"])
+        row += [r["month_name"], f"{prev:,.2f}", f"{this:,.2f}", f"{pct}%"]
+        rows.append(row)
     _paged_table_to_pdf(pdf, headers, rows, col_widths)
 
-    # 2️⃣ Yearly Summary
+    # Monthly Grand Totals
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Monthly Grand Totals", 0, 1)
+    monthly_total = monthly_df.groupby("month_name")[["previous_year", "this_year"]].sum().reset_index()
+    headers = ["Month", "Previous Year", "This Year", "% Change"]
+    col_widths = [60, 50, 50, 30]
+    rows = []
+    for _, r in monthly_total.iterrows():
+        prev, this = r["previous_year"], r["this_year"]
+        pct = round((this-prev)/prev*100,2) if prev!=0 else ("∞" if this>0 else 0)
+        rows.append([r["month_name"], f"{prev:,.2f}", f"{this:,.2f}", f"{pct}%"])
+    _paged_table_to_pdf(pdf, headers, rows, col_widths)
+
+    # Yearly Summary
     pdf.add_page()
     pdf.set_font("Arial", "B", 14)
     pdf.cell(0, 10, "Yearly Summary", 0, 1)
+    yearly_summary = df.groupby("department")[["previous_year","this_year"]].sum().reset_index()
+    yearly_summary["percent_change"] = yearly_summary.apply(lambda r: round((r["this_year"]-r["previous_year"])/r["previous_year"]*100,2) if r["previous_year"]!=0 else ("∞" if r["this_year"]>0 else 0), axis=1)
+    grand_total = yearly_summary[["previous_year","this_year"]].sum()
+    headers = ["Department","Previous Year","This Year","% Change"]
+    col_widths = [60,50,50,30]
+    rows = [[r["department"], f"{r['previous_year']:,.2f}", f"{r['this_year']:,.2f}", f"{r['percent_change']}%"] for _,r in yearly_summary.iterrows()]
+    rows.append(["GRAND TOTAL", f"{grand_total['previous_year']:,.2f}", f"{grand_total['this_year']:,.2f}", f"{round((grand_total['this_year']-grand_total['previous_year'])/grand_total['previous_year']*100,2) if grand_total['previous_year']!=0 else ('∞' if grand_total['this_year']>0 else 0)}%"])
+    _paged_table_to_pdf(pdf, headers, rows, col_widths)
 
-    yearly_prev = summary_df["previous_year"].sum()
-    yearly_this = summary_df["this_year"].sum()
-    yearly_pct = 0.0 if yearly_prev==0 else round((yearly_this-yearly_prev)/yearly_prev*100,2)
-
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(50, 10, "Previous Year", 1)
-    pdf.cell(50, 10, "This Year", 1)
-    pdf.cell(50, 10, "% Change", 1)
-    pdf.ln()
-    pdf.set_font("Arial", "", 12)
-    pdf.cell(50, 10, f"{yearly_prev:,.2f}", 1)
-    pdf.cell(50, 10, f"{yearly_this:,.2f}", 1)
-    pdf.cell(50, 10, f"{yearly_pct}%", 1)
     pdf.output(output_path)
-    
 
 # -------------------------------
 # Instruction parser
@@ -337,37 +297,32 @@ def parse_user_instructions(text: str) -> List[Instruction]:
         if not p_str:
             continue
 
-        # Remove
         m = re.search(r"(remove|eliminate|delete)\s+([a-zA-Z &\-]+)", p_str, flags=re.IGNORECASE)
         if m:
             instructions.append(Instruction(action="remove", domain=m.group(2).strip()))
             continue
 
-        # Allocate
         m = re.search(r"allocate\s+(\d+(\.\d+)?)%\s+(of\s+(the\s+)?)?(total\s+budget|budget)\s+(to|for)\s+([a-zA-Z &\-]+)", p_str, flags=re.IGNORECASE)
         if m:
             instructions.append(Instruction(action="allocate", domain=m.group(7).strip(), percent=float(m.group(1))))
             continue
 
-        # Headcount
         m = re.search(r"(increase|decrease|reduce)\s+([a-zA-Z &\-]+)\s+headcount\s+by\s+([+-]?\d+(\.\d+)?\s*%?)", p_str, flags=re.IGNORECASE)
         if m:
             change = m.group(3).strip()
-            if m.group(1).lower() in ["decrease", "reduce"] and not change.startswith("-"):
-                change = "-" + change
+            if m.group(1).lower() in ["decrease","reduce"] and not change.startswith("-"):
+                change = "-"+change
             instructions.append(Instruction(action="headcount", domain=m.group(2).strip(), change=change))
             continue
 
-        # Adjust
         m = re.search(r"(increase|decrease|reduce)\s+([a-zA-Z &\-]+)\s+by\s+([+-]?\d+(\.\d+)?\s*%?)", p_str, flags=re.IGNORECASE)
         if m:
             change = m.group(3).strip()
-            if m.group(1).lower() in ["decrease", "reduce"] and not change.startswith("-"):
-                change = "-" + change
+            if m.group(1).lower() in ["decrease","reduce"] and not change.startswith("-"):
+                change = "-"+change
             instructions.append(Instruction(action="adjust", domain=m.group(2).strip(), change=change))
             continue
 
-        # Fallback: domain + percent
         m = re.search(r"([a-zA-Z &\-]+)\s*([+-]?\d+(\.\d+)?\s*%?)$", p_str)
         if m:
             instructions.append(Instruction(action="adjust", domain=m.group(1).strip(), change=m.group(2).strip()))
@@ -382,41 +337,36 @@ async def generate_budget(file: UploadFile = File(...), instructions: Optional[s
     suffix = os.path.splitext(file.filename)[1].lower()
     if suffix not in ALLOWED_SUFFIXES:
         raise HTTPException(status_code=400, detail=f"Unsupported file type '{suffix}'.")
-
     content = await file.read()
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Uploaded file too large.")
-
     fd, tmp_file_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     try:
-        with open(tmp_file_path, "wb") as f:
+        with open(tmp_file_path,"wb") as f:
             f.write(content)
 
         def process_and_generate():
-            raw = pd.read_csv(tmp_file_path) if suffix == ".csv" else pd.read_excel(tmp_file_path)
+            raw = pd.read_csv(tmp_file_path) if suffix==".csv" else pd.read_excel(tmp_file_path)
             df = normalize_columns(raw)
             monthly_df = aggregate_monthly(df)
-
             instructions_list: List[Instruction] = []
             if instructions and instructions.strip():
                 instructions_list.extend(parse_user_instructions(instructions))
             if adjustments:
                 for a in adjustments:
                     instructions_list.append(Instruction(action="adjust", domain=a.domain, change=a.change))
-
-            warnings = []
+            warnings=[]
             if instructions_list:
                 monthly_df, warn = apply_instructions(monthly_df, instructions_list)
                 warnings.extend(warn)
-
             summary_df = summarize_spending(monthly_df)
             tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
             generate_budget_pdf(monthly_df, summary_df, tmp_pdf_file, instructions or "", warnings)
             return tmp_pdf_file, warnings
 
         tmp_pdf_file, warnings = await run_in_threadpool(process_and_generate)
-        response = {"status": "success", "download_link": f"https://budget-snapshot-agent.onrender.com/download/{os.path.basename(tmp_pdf_file)}"}
+        response = {"status":"success", "download_link": f"/download/{os.path.basename(tmp_pdf_file)}"}
         if warnings:
             response["warnings"] = warnings
         return response
@@ -434,7 +384,6 @@ async def generate_budget_url(request: BudgetRequest):
         raise HTTPException(status_code=400, detail=f"Failed to download file: {e}")
     if resp.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Could not download file: HTTP {resp.status_code}")
-
     cl = resp.headers.get("Content-Length")
     if cl and int(cl) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Remote file too large")
@@ -442,33 +391,30 @@ async def generate_budget_url(request: BudgetRequest):
     fd, tmp_file_path = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
     try:
-        with open(tmp_file_path, "wb") as f:
+        with open(tmp_file_path,"wb") as f:
             f.write(resp.content)
 
         def process_and_generate():
             raw = pd.read_excel(tmp_file_path)
             df = normalize_columns(raw)
             monthly_df = aggregate_monthly(df)
-
             instructions_list: List[Instruction] = []
             if request.instructions and request.instructions.strip():
                 instructions_list.extend(parse_user_instructions(request.instructions))
             if request.adjustments:
                 for a in request.adjustments:
                     instructions_list.append(Instruction(action="adjust", domain=a.domain, change=a.change))
-
-            warnings = []
+            warnings=[]
             if instructions_list:
                 monthly_df, warn = apply_instructions(monthly_df, instructions_list)
                 warnings.extend(warn)
-
             summary_df = summarize_spending(monthly_df)
             tmp_pdf_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}_budget_snapshot.pdf")
             generate_budget_pdf(monthly_df, summary_df, tmp_pdf_file, request.instructions or "", warnings)
             return tmp_pdf_file, warnings
 
         tmp_pdf_file, warnings = await run_in_threadpool(process_and_generate)
-        response = {"status": "success", "download_link": f"https://budget-snapshot-agent.onrender.com/download/{os.path.basename(tmp_pdf_file)}"}
+        response = {"status":"success", "download_link": f"/download/{os.path.basename(tmp_pdf_file)}"}
         if warnings:
             response["warnings"] = warnings
         return response
@@ -481,4 +427,4 @@ def download_file(file_name: str):
     file_path = os.path.join(tempfile.gettempdir(), file_name)
     if os.path.exists(file_path):
         return FileResponse(file_path, filename="Budget_Snapshot.pdf", media_type="application/pdf")
-    return JSONResponse(status_code=404, content={"status": "error", "message": "File not found"})
+    return JSONResponse(status_code=404, content={"status":"error","message":"File not found"})
