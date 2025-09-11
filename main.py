@@ -137,7 +137,6 @@ def match_mask_for_domain(df: pd.DataFrame, domain: str) -> pd.Series:
 def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tuple[pd.DataFrame, List[str]]:
     df = df.copy()
     warnings = []
-    constrained_mask = pd.Series(False, index=df.index)
 
     for instr in [i for i in instructions if i.action == "remove"]:
         mask = match_mask_for_domain(df, instr.domain)
@@ -146,15 +145,12 @@ def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tup
             continue
         df = df.loc[~mask].reset_index(drop=True)
 
-    total_before = df["previous_year"].sum()
     for instr in [i for i in instructions if i.action == "allocate"]:
         mask = match_mask_for_domain(df, instr.domain)
         if not mask.any():
             warnings.append(f"No rows matched to allocate to '{instr.domain}'")
             continue
-        target_share = (instr.percent / 100.0) * total_before
-        df.loc[mask, "this_year"] = target_share
-        constrained_mask = constrained_mask | mask
+        df.loc[mask, "this_year"] = (instr.percent / 100.0) * df["previous_year"].sum()
 
     for instr in [i for i in instructions if i.action in ["headcount", "adjust"]]:
         factor = parse_change_to_factor(instr.change)
@@ -166,16 +162,6 @@ def apply_instructions(df: pd.DataFrame, instructions: List[Instruction]) -> Tup
             warnings.append(f"No rows matched for {instr.action} '{instr.domain}'")
             continue
         df.loc[mask, "this_year"] *= factor
-        constrained_mask = constrained_mask | mask
-
-    total_after_constrained = df.loc[constrained_mask, "this_year"].sum()
-    remaining_after = df.loc[~constrained_mask, "this_year"].sum()
-    if constrained_mask.any() and remaining_after > 0:
-        rebalancer = (total_before - total_after_constrained) / remaining_after
-        if math.isfinite(rebalancer) and rebalancer > 0:
-            df.loc[~constrained_mask, "this_year"] *= rebalancer
-        else:
-            warnings.append("Invalid rebalancer, skipped proportional scaling")
 
     df["this_year"] = df["this_year"].clip(lower=0)
     return df, warnings
@@ -231,58 +217,46 @@ def generate_budget_pdf(df: pd.DataFrame, summary_df: pd.DataFrame, output_path:
         pdf.multi_cell(0, 6, "Warnings:\n" + "\n".join(warnings))
     pdf.ln(5)
 
-    # Monthly Analysis
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Monthly Analysis", 0, 1)
-    monthly_df = df.copy()
-    monthly_df["month_ts"] = pd.to_datetime(monthly_df["month_name"], format="%B %Y")
-    monthly_df = monthly_df.sort_values(["department", "expense_category" if "expense_category" in monthly_df.columns else "department", "month_ts"])
-
-    headers = ["Department"]
-    if "expense_category" in monthly_df.columns:
-        headers.append("Category")
-    headers += ["Month", "Previous Year", "This Year", "% Change"]
-    col_widths = [50, 40, 50, 35, 35, 30] if "expense_category" in monthly_df.columns else [60, 50, 35, 35, 30]
-
-    rows = []
-    for _, r in monthly_df.iterrows():
-        prev, this = r["previous_year"], r["this_year"]
-        pct = round((this-prev)/prev*100,2) if prev!=0 else ("∞" if this>0 else 0)
-        row = [r["department"]]
-        if "expense_category" in monthly_df.columns:
-            row.append(r["expense_category"])
-        row += [r["month_name"], f"{prev:,.2f}", f"{this:,.2f}", f"{pct}%"]
-        rows.append(row)
-    _paged_table_to_pdf(pdf, headers, rows, col_widths)
-
+    # -----------------
     # Monthly Grand Totals
-    pdf.add_page()
+    # -----------------
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Monthly Grand Totals", 0, 1)
-    monthly_total = monthly_df.groupby("month_name")[["previous_year", "this_year"]].sum().reset_index()
+    monthly_total = df.groupby("month_name")[["previous_year", "this_year"]].sum().reset_index()
     headers = ["Month", "Previous Year", "This Year", "% Change"]
     col_widths = [60, 50, 50, 30]
     rows = []
     for _, r in monthly_total.iterrows():
         prev, this = r["previous_year"], r["this_year"]
-        pct = round((this-prev)/prev*100,2) if prev!=0 else ("∞" if this>0 else 0)
+        pct = round((this-prev)/prev*100,2) if prev != 0 else ("∞" if this>0 else 0)
         rows.append([r["month_name"], f"{prev:,.2f}", f"{this:,.2f}", f"{pct}%"])
     _paged_table_to_pdf(pdf, headers, rows, col_widths)
 
+    # -----------------
     # Yearly Summary
+    # -----------------
     pdf.add_page()
     pdf.set_font("Arial", "B", 14)
     pdf.cell(0, 10, "Yearly Summary", 0, 1)
     yearly_summary = df.groupby("department")[["previous_year","this_year"]].sum().reset_index()
-    yearly_summary["percent_change"] = yearly_summary.apply(lambda r: round((r["this_year"]-r["previous_year"])/r["previous_year"]*100,2) if r["previous_year"]!=0 else ("∞" if r["this_year"]>0 else 0), axis=1)
+    yearly_summary["percent_change"] = yearly_summary.apply(
+        lambda r: round((r["this_year"]-r["previous_year"])/r["previous_year"]*100,2)
+        if r["previous_year"]!=0 else ("∞" if r["this_year"]>0 else 0), axis=1)
     grand_total = yearly_summary[["previous_year","this_year"]].sum()
     headers = ["Department","Previous Year","This Year","% Change"]
     col_widths = [60,50,50,30]
-    rows = [[r["department"], f"{r['previous_year']:,.2f}", f"{r['this_year']:,.2f}", f"{r['percent_change']}%"] for _,r in yearly_summary.iterrows()]
-    rows.append(["GRAND TOTAL", f"{grand_total['previous_year']:,.2f}", f"{grand_total['this_year']:,.2f}", f"{round((grand_total['this_year']-grand_total['previous_year'])/grand_total['previous_year']*100,2) if grand_total['previous_year']!=0 else ('∞' if grand_total['this_year']>0 else 0)}%"])
+    rows = [[r["department"], f"{r['previous_year']:,.2f}", f"{r['this_year']:,.2f}", f"{r['percent_change']}%"]
+            for _,r in yearly_summary.iterrows()]
+    rows.append([
+        "GRAND TOTAL",
+        f"{grand_total['previous_year']:,.2f}",
+        f"{grand_total['this_year']:,.2f}",
+        f"{round((grand_total['this_year']-grand_total['previous_year'])/grand_total['previous_year']*100,2) if grand_total['previous_year']!=0 else ('∞' if grand_total['this_year']>0 else 0)}%"
+    ])
     _paged_table_to_pdf(pdf, headers, rows, col_widths)
 
     pdf.output(output_path)
+
 
 # -------------------------------
 # Instruction parser
@@ -414,7 +388,7 @@ async def generate_budget_url(request: BudgetRequest):
             return tmp_pdf_file, warnings
 
         tmp_pdf_file, warnings = await run_in_threadpool(process_and_generate)
-        response = {"status":"success", "download_link": f"https://budget-snapshot-agent.onrender.com/download/{os.path.basename(tmp_pdf_file)}"}
+        response = {"status":"success", "download_link": f"http://127.0.0.1:8000/download/{os.path.basename(tmp_pdf_file)}"}
         if warnings:
             response["warnings"] = warnings
         return response
