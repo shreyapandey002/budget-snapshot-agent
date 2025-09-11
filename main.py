@@ -365,7 +365,7 @@ async def generate_budget(file: UploadFile = File(...), instructions: Optional[s
             return tmp_pdf_file, warnings
 
         tmp_pdf_file, warnings = await run_in_threadpool(process_and_generate)
-        response = {"status": "success", "download_link": f"/download/{os.path.basename(tmp_pdf_file)}"}
+        response = {"status": "success", "download_link": f"https://budget-snapshot-agent.onrender.com/download/{os.path.basename(tmp_pdf_file)}"}
         if warnings:
             response["warnings"] = warnings
         return response
@@ -417,7 +417,7 @@ async def generate_budget_url(request: BudgetRequest):
             return tmp_pdf_file, warnings
 
         tmp_pdf_file, warnings = await run_in_threadpool(process_and_generate)
-        response = {"status": "success", "download_link": f"/download/{os.path.basename(tmp_pdf_file)}"}
+        response = {"status": "success", "download_link": f"https://budget-snapshot-agent.onrender.com/download/{os.path.basename(tmp_pdf_file)}"}
         if warnings:
             response["warnings"] = warnings
         return response
