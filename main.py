@@ -149,8 +149,29 @@ def apply_instructions(weekly_df: pd.DataFrame, instructions: List[Instruction])
         if not mask_tgt.any():
             warnings.append(f"No rows matched to merge into '{instr.target}', skipping merge")
             continue
-        df.loc[mask_tgt, ["before_budget", "after_budget"]] += df.loc[mask_src, ["before_budget", "after_budget"]].sum()
-        df = df.loc[~mask_src]
+        
+        # For each category under source, merge into target
+        categories = df.loc[mask_src, "expense_category"].unique() if "expense_category" in df.columns else [None]
+        for cat in categories:
+            if cat is None:
+                src_rows = df[mask_src]
+                tgt_rows = df[mask_tgt]
+            else:
+                src_rows = df[mask_src & (df["expense_category"] == cat)]
+                tgt_rows = df[mask_tgt & (df["expense_category"] == cat)]
+            if src_rows.empty:
+                continue
+            
+            if not tgt_rows.empty:
+                # Add into existing target row
+                df.loc[tgt_rows.index, ["before_budget", "after_budget"]] += src_rows[["before_budget", "after_budget"]].sum()
+            else:
+               # Move source row(s) to target dept
+                moved = src_rows.copy()
+                moved.loc[:, "department"] = instr.target
+                df = pd.concat([df, moved], ignore_index=True)
+        # Drop all source rows
+        df = df.loc[~mask_src].reset_index(drop=True)
 
     # Remove
     for instr in [i for i in instructions if i.action == "remove"]:
@@ -158,7 +179,7 @@ def apply_instructions(weekly_df: pd.DataFrame, instructions: List[Instruction])
         if not mask.any():
             warnings.append(f"No rows matched to remove '{instr.domain}'")
             continue
-        df = df.loc[~mask]
+        df = df.loc[~mask].reset_index(drop=True)
 
     # Allocate
     total_before = df["before_budget"].sum()
@@ -255,36 +276,7 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
         pdf.multi_cell(0, 6, "Warnings:\n" + "\n".join(warnings))
     pdf.ln(5)
 
-    # Weekly breakdown
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Weekly Budget Breakdown", 0, 1)
-
-    headers = ["Department"]
-    if "expense_category" in weekly_df.columns:
-        headers.append("Category")
-    headers += ["Week Range", "Before", "After", "% Change"]
-
-    if "expense_category" in weekly_df.columns:
-        col_widths = [40, 40, 45, 25, 25, 25]
-    else:
-        col_widths = [60, 50, 30, 30, 30]
-
-    rows = []
-    for _, r in weekly_df.iterrows():
-        week_range = f"{r['week_start'].strftime('%Y-%m-%d')} to {r['week_end'].strftime('%Y-%m-%d')}"
-        before = float(r["before_budget"])
-        after = float(r["after_budget"])
-        pct = 0.0 if before == 0 else ((after - before) / before) * 100.0
-        vals = [r["department"]]
-        if "expense_category" in weekly_df.columns:
-            vals.append(r["expense_category"])
-        vals += [week_range, f"{before:,.2f}", f"{after:,.2f}", f"{pct:.2f}%"]
-        rows.append(vals)
-
-    _paged_table_to_pdf(pdf, headers, rows, col_widths)
-
-    # Department summary
-    pdf.add_page()
+    # Department Summary 
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Department Summary", 0, 1)
 
@@ -299,6 +291,9 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
         col_widths = [60, 40, 40, 40]
 
     rows = []
+    total_before_sum = 0.0
+    total_after_sum = 0.0
+
     for _, r in summary_df.iterrows():
         before = float(r["before_budget"])
         after = float(r["after_budget"])
@@ -309,6 +304,21 @@ def generate_budget_pdf(weekly_df: pd.DataFrame, summary_df: pd.DataFrame, outpu
         vals += [f"{before:,.2f}", f"{after:,.2f}", f"{pct}%" if isinstance(pct, float) else str(pct)]
         rows.append(vals)
 
+        total_before_sum += before
+        total_after_sum += after
+
+    # --- Add Grand Total row ---
+    pct_total = "∞" if total_before_sum == 0 and total_after_sum > 0 else 0.0 if total_before_sum == 0 else round((total_after_sum - total_before_sum) / total_before_sum * 100, 2)
+    total_row = ["GRAND TOTAL"]
+    if "expense_category" in summary_df.columns:
+        total_row.append("")  # blank for category column
+    total_row += [
+        f"{total_before_sum:,.2f}",
+        f"{total_after_sum:,.2f}",
+        f"{pct_total}%" if isinstance(pct_total, float) else str(pct_total),
+    ]
+    rows.append(total_row)
+    
     _paged_table_to_pdf(pdf, headers, rows, col_widths)
     pdf.output(output_path)
 
